@@ -9,126 +9,190 @@
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-    <div class="container mt-5">
-        <div class="row justify-content-center">
-            <div class="col-md-8">
-                <div class="card">
-                    <div class="card-header">
-                        <h1 class="text-center mb-0">Fall Detection System</h1>
-                        <p class="text-center text-muted mb-0">Upload a video (max 30 seconds) to detect fall accidents</p>
-                    </div>
-                    <div class="card-body">
 
-                        <!-- Upload Section -->
-                        <div class="upload-section mb-4">
-                            <div class="mb-3">
-                                <label for="videoUpload" class="form-label">Select Video File</label>
-                                <input type="file" class="form-control" id="videoUpload" accept="video/*">
-                                <div class="form-text">Supported formats: MP4, MOV, AVI, WebM (Max 30 seconds)</div>
-                            </div>
-                            
-                            <!-- Video Preview -->
-                            <div id="videoPreview" class="mb-3" style="display: none;">
-                                <video id="previewPlayer" class="w-100 rounded" controls></video>
-                                <div class="mt-2">
-                                    <span id="videoDuration" class="badge bg-info"></span>
-                                    <span id="videoSize" class="badge bg-secondary ms-2"></span>
-                                </div>
-                            </div>
-                            
-                            <!-- Analyze Button -->
-                            <button id="analyzeBtn" class="btn btn-primary w-100" disabled>
-                                <span class="spinner-border spinner-border-sm d-none me-2" id="loadingSpinner" role="status" aria-hidden="true"></span>
-                                <i class="bi bi-search me-1" id="analyzeIcon"></i>
-                                Analyze Video for Fall Detection
-                            </button>
+<!-- Hidden canvas used by LocalFallDetector for frame extraction -->
+<canvas id="analysisCanvas" style="display:none;"></canvas>
 
-                            <!-- Loading Status Message -->
-                            <div id="loadingStatus" class="d-none mt-3">
-                                <div class="d-flex align-items-center gap-2 text-muted small">
-                                    <div class="spinner-grow spinner-grow-sm text-primary" role="status"></div>
-                                    <span id="loadingMessage">Preparing...</span>
-                                </div>
-                                <div class="progress mt-2" style="height: 4px;">
-                                    <div class="progress-bar progress-bar-striped progress-bar-animated bg-primary w-100"></div>
-                                </div>
-                            </div>
-                        </div>
-                        
-                        <!-- Results Section -->
-                        <div id="resultsSection" style="display: none;">
-                            <h5 class="mb-3">
-                                <i class="bi bi-clipboard2-pulse me-2 text-primary"></i>Analysis Results
-                            </h5>
-                            <div class="result-card border rounded p-3 bg-light">
-                                <div class="row g-3">
-                                    <div class="col-md-4">
-                                        <div class="result-item text-center">
-                                            <div class="small text-muted mb-1">Fall Detected</div>
-                                            <span id="fallResult" class="badge fs-6 px-3 py-2"></span>
-                                        </div>
-                                    </div>
-                                    <div class="col-md-4">
-                                        <div class="result-item text-center">
-                                            <div class="small text-muted mb-1">Confidence</div>
-                                            <span id="confidenceResult" class="badge fs-6 px-3 py-2"></span>
-                                        </div>
-                                    </div>
-                                    <div class="col-md-4">
-                                        <div class="result-item text-center">
-                                            <div class="small text-muted mb-1">Person Present</div>
-                                            <span id="personPresentResult" class="badge fs-6 px-3 py-2"></span>
-                                        </div>
-                                    </div>
-                                </div>
-                                <hr>
-                                <div>
-                                    <div class="small text-muted mb-1">
-                                        <i class="bi bi-chat-left-text me-1"></i>Explanation
-                                    </div>
-                                    <p id="explanationResult" class="mb-0 text-dark"></p>
-                                </div>
-                            </div>
-                        </div>
-                        
-                        <!-- Error Alert -->
-                        <div id="errorAlert" class="alert alert-danger mt-3" style="display: none;">
-                            <div class="d-flex align-items-start">
-                                <i class="bi bi-exclamation-triangle-fill me-2 mt-1 flex-shrink-0"></i>
-                                <div class="flex-grow-1">
-                                    <strong>Error:</strong> <span id="errorMessage"></span>
-                                    <div class="mt-1">
-                                        <small class="text-muted">If this error persists, please refresh the page or try a different video file.</small>
-                                    </div>
-                                </div>
-                                <button type="button" class="btn-close ms-2 flex-shrink-0" onclick="fallDetectionApp.hideError()"></button>
-                            </div>
-                        </div>
-                        
-                        <!-- Browser Compatibility Warning -->
-                        <div id="compatibilityWarning" class="alert alert-warning mt-3" style="display: none;">
-                            <div class="d-flex align-items-center">
-                                <i class="bi bi-info-circle-fill me-2"></i>
-                                <div class="flex-grow-1">
-                                    <strong>Browser Compatibility:</strong> <span id="compatibilityMessage"></span>
-                                </div>
-                            </div>
-                        </div>
+<div class="container mt-5 mb-5">
+    <div class="row justify-content-center">
+        <div class="col-md-8">
+            <div class="card shadow-sm">
 
-                    </div>
-
-                    <!-- Card Footer -->
-                    <div class="card-footer text-center text-muted small">
-                        <i class="bi bi-shield-lock me-1"></i>
-                        Video is uploaded to Google servers for analysis only and is not stored permanently.
+                <!-- Header -->
+                <div class="card-header py-3">
+                    <div class="d-flex align-items-center justify-content-between">
+                        <div>
+                            <h1 class="h4 mb-0">
+                                <i class="bi bi-person-falling text-danger me-2"></i>Fall Detection System
+                            </h1>
+                            <p class="text-muted small mb-0">Upload a video (max 30s) to detect fall accidents</p>
+                        </div>
+                        <!-- Model status badge — updated dynamically by JS -->
+                        <span id="modelStatus" class="badge bg-warning text-dark">
+                            <i class="bi bi-hourglass-split me-1"></i>Loading ML model...
+                        </span>
                     </div>
                 </div>
+
+                <div class="card-body">
+
+                    <!-- Upload Section -->
+                    <div class="upload-section mb-4">
+                        <div class="mb-3">
+                            <label for="videoUpload" class="form-label fw-semibold">Select Video File</label>
+                            <input type="file" class="form-control" id="videoUpload" accept="video/*">
+                            <div class="form-text">
+                                <i class="bi bi-info-circle me-1"></i>
+                                Supported: MP4, MOV, AVI, WebM · Max 30 seconds · Runs locally in your browser
+                            </div>
+                        </div>
+
+                        <!-- Video Preview -->
+                        <div id="videoPreview" class="mb-3" style="display:none;">
+                            <video id="previewPlayer" class="w-100 rounded border" controls></video>
+                            <div class="mt-2">
+                                <span id="videoDuration" class="badge bg-info"></span>
+                                <span id="videoSize"     class="badge bg-secondary ms-2"></span>
+                            </div>
+                        </div>
+
+                        <!-- Analyze Button -->
+                        <button id="analyzeBtn" class="btn btn-primary w-100 py-2" disabled>
+                            <span class="spinner-border spinner-border-sm d-none me-2" id="loadingSpinner" role="status"></span>
+                            <i class="bi bi-search me-1" id="analyzeIcon"></i>
+                            Analyze Video for Fall Detection
+                        </button>
+
+                        <!-- Loading Status -->
+                        <div id="loadingStatus" class="d-none mt-3">
+                            <div class="d-flex align-items-center gap-2 text-muted small">
+                                <div class="spinner-grow spinner-grow-sm text-primary flex-shrink-0" role="status"></div>
+                                <span id="loadingMessage">Preparing...</span>
+                            </div>
+                            <div class="progress mt-2" style="height:4px;">
+                                <div class="progress-bar progress-bar-striped progress-bar-animated bg-primary w-100"></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Results Section -->
+                    <div id="resultsSection" style="display:none;">
+                        <h5 class="mb-3">
+                            <i class="bi bi-clipboard2-pulse me-2 text-primary"></i>Analysis Results
+                        </h5>
+
+                        <div class="result-card border rounded p-3 bg-light">
+
+                            <!-- Primary result badges -->
+                            <div class="row g-3 mb-3">
+                                <div class="col-6 col-md-3">
+                                    <div class="text-center">
+                                        <div class="small text-muted mb-1">Fall Detected</div>
+                                        <span id="fallResult" class="badge fs-6 px-3 py-2 w-100"></span>
+                                    </div>
+                                </div>
+                                <div class="col-6 col-md-3">
+                                    <div class="text-center">
+                                        <div class="small text-muted mb-1">Confidence</div>
+                                        <span id="confidenceResult" class="badge fs-6 px-3 py-2 w-100"></span>
+                                    </div>
+                                </div>
+                                <div class="col-6 col-md-3">
+                                    <div class="text-center">
+                                        <div class="small text-muted mb-1">Person Present</div>
+                                        <span id="personPresentResult" class="badge fs-6 px-3 py-2 w-100"></span>
+                                    </div>
+                                </div>
+                                <div class="col-6 col-md-3">
+                                    <div class="text-center">
+                                        <div class="small text-muted mb-1">Engine</div>
+                                        <span id="engineResult" class="badge bg-dark fs-6 px-2 py-2 w-100" style="font-size:0.7rem !important;"></span>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Explanation -->
+                            <div class="mb-3">
+                                <div class="small text-muted mb-1">
+                                    <i class="bi bi-chat-left-text me-1"></i>Explanation
+                                </div>
+                                <p id="explanationResult" class="mb-0 text-dark small"></p>
+                            </div>
+
+                            <!-- Frame Stats (only shown for local ML results) -->
+                            <div id="frameStatsSection" style="display:none;">
+                                <hr class="my-2">
+                                <div class="small text-muted mb-2">
+                                    <i class="bi bi-camera-video me-1"></i>Frame Analysis Details
+                                </div>
+                                <div class="row g-2 text-center">
+                                    <div class="col-4">
+                                        <div class="border rounded p-2 bg-white">
+                                            <div class="small text-muted">Frames w/ Person</div>
+                                            <div class="fw-bold" id="statFrames">—</div>
+                                        </div>
+                                    </div>
+                                    <div class="col-4">
+                                        <div class="border rounded p-2 bg-white">
+                                            <div class="small text-muted">Fall Pose Frames</div>
+                                            <div class="fw-bold text-danger" id="statFallFrames">—</div>
+                                        </div>
+                                    </div>
+                                    <div class="col-4">
+                                        <div class="border rounded p-2 bg-white">
+                                            <div class="small text-muted">Drop Detected</div>
+                                            <div class="fw-bold" id="statDrop">—</div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                        </div>
+                    </div>
+
+                    <!-- Error Alert -->
+                    <div id="errorAlert" class="alert alert-danger mt-3" style="display:none;">
+                        <div class="d-flex align-items-start">
+                            <i class="bi bi-exclamation-triangle-fill me-2 mt-1 flex-shrink-0"></i>
+                            <div class="flex-grow-1">
+                                <strong>Error:</strong> <span id="errorMessage"></span>
+                                <div class="mt-1">
+                                    <small class="text-muted">If this persists, refresh the page or try a different video.</small>
+                                </div>
+                            </div>
+                            <button type="button" class="btn-close ms-2 flex-shrink-0" onclick="fallDetectionApp.hideError()"></button>
+                        </div>
+                    </div>
+
+                    <!-- Browser Compatibility Warning -->
+                    <div id="compatibilityWarning" class="alert alert-warning mt-3" style="display:none;">
+                        <i class="bi bi-info-circle-fill me-2"></i>
+                        <strong>Browser Compatibility:</strong> <span id="compatibilityMessage"></span>
+                    </div>
+
+                </div>
+
+                <!-- Footer -->
+                <div class="card-footer text-center text-muted small py-2">
+                    <i class="bi bi-cpu me-1"></i>
+                    Analysis runs locally in your browser using TensorFlow.js — no video is uploaded unless AI enhancement is requested.
+                </div>
+
             </div>
         </div>
     </div>
+</div>
 
-    <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
-    <script src="app.js"></script>
+<!-- jQuery + Bootstrap -->
+<script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+
+<!-- TensorFlow.js + MoveNet pose detection (local ML) -->
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection@2.1.3/dist/pose-detection.min.js"></script>
+
+<!-- App -->
+<script src="app.js"></script>
+
 </body>
 </html>
