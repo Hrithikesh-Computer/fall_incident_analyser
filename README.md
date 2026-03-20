@@ -1,262 +1,208 @@
+
 # Fall Detection Web Application
 
-A web application that uses Google Gemini AI to analyze videos and detect human fall accidents with confidence scoring.
+A web application that detects human fall accidents in videos using **local AI (TensorFlow.js MoveNet)** running entirely in the browser. Google Gemini API is used optionally as a fallback when local confidence is low.
 
 ## Features
 
-- **Video Upload**: Support for MP4, MOV, AVI, WebM formats
-- **Duration Validation**: Automatically restricts videos to 30 seconds maximum
-- **AI-Powered Analysis**: Uses Google Gemini Pro Vision for intelligent fall detection
-- **Confidence Scoring**: Provides confidence percentage for analysis results
-- **Responsive Design**: Works on desktop and mobile devices
-- **Real-time Preview**: Video preview with duration and file size display
+* **Local ML Analysis** : Pose estimation via TensorFlow.js MoveNet — no API key required for primary analysis
+* **Gemini AI Fallback** : Automatically escalates to Gemini API when local confidence is below 55%
+* **Frame-by-Frame Analysis** : Samples 24 frames, scores each for fall indicators (body angle, aspect ratio, hip height, vertical span, drop detection)
+* **Confidence Scoring** : Color-coded confidence percentage with per-frame breakdown
+* **Video Upload** : Supports MP4, MOV, AVI, WebM up to 100MB / 30 seconds
+* **Real-time Status** : Live loading messages showing each analysis step
+* **Responsive Design** : Works on desktop and mobile browsers
 
 ## Technical Stack
 
-- **Frontend**: HTML5, CSS3, JavaScript (ES6+), jQuery
-- **UI Framework**: Bootstrap 5
-- **AI Integration**: Google Gemini Pro Vision API via direct REST calls
-- **Styling**: Custom CSS with gradient designs
+* **Frontend** : HTML5, CSS3, JavaScript (ES6+), jQuery
+* **UI Framework** : Bootstrap 5 + Bootstrap Icons
+* **Local ML** : TensorFlow.js 4.17 + MoveNet SINGLEPOSE_THUNDER (pose-detection 2.1.3)
+* **AI Fallback** : Google Gemini 2.0 Flash via REST API (File API upload)
+
+## How It Works
+
+### Analysis Pipeline
+
+```
+1. LocalFallDetector (TF.js MoveNet)
+   └─ Extracts 24 frames from video
+   └─ Runs pose estimation on each frame
+   └─ Scores each frame for fall indicators
+   └─ confidence ≥ 55%? → show result ✓
+   └─ confidence < 55%? → escalate to Gemini
+
+2. GeminiAnalyzer (fallback only)
+   └─ Uploads video via Gemini File API (multipart)
+   └─ Waits for Google to process video
+   └─ Sends local analysis context + video to gemini-2.0-flash
+   └─ Returns enhanced result
+
+3. If Gemini is skipped or fails
+   └─ Shows local result with a warning note
+```
+
+### Fall Detection Metrics (Local ML)
+
+| Metric         | Description                    | Threshold                     |
+| -------------- | ------------------------------ | ----------------------------- |
+| Aspect Ratio   | Body bounding box width/height | > 1.4 → lying down           |
+| Hip Height     | Normalized Y position of hips  | > 60% of frame → near ground |
+| Vertical Span  | Shoulder-to-ankle distance     | < 38% of frame → horizontal  |
+| Body Angle     | Torso angle from vertical      | > 55° → tilted/fallen       |
+| Drop Detection | Sudden downward hip movement   | > 18% frame height per step   |
 
 ## Prerequisites
 
-1. **Google Gemini API Key**: Get your API key from [Google AI Studio](https://makersuite.google.com/app/apikey)
-2. **Web Browser**: Modern browser with JavaScript support
-3. **Local Server**: Python 3.x (for running locally)
+1. **Web Browser** : Chrome 90+, Firefox 88+, Safari 14+, or Edge 90+
+2. **Gemini API Key**  *(optional)* : Only needed when local confidence is low. Get one free at [Google AI Studio](https://aistudio.google.com/app/apikey)
 
 ## Installation & Setup
 
-### 1. Clone/Download the Project
+### 1. Clone or Download
 
 ```bash
-# If using git
 git clone <repository-url>
-cd zimozi_assignment
-
-# Or download and extract the files to your preferred directory
+cd fall-detection-app
 ```
 
 ### 2. Start Local Server
 
 ```bash
-# Navigate to the project directory
-cd zimozi_assignment
-
-# Start Python HTTP server
+# Python 3
 python -m http.server 8000
+
+# Or Node.js
+npx serve .
 ```
 
-### 3. Access the Application
+### 3. Open in Browser
 
-Open your web browser and navigate to:
 ```
 http://localhost:8000
 ```
 
-## Usage Instructions
+> **Note** : A local server is required because TensorFlow.js loads model weights from a CDN, which browsers block when opening files directly via `file://`.
+
+## Usage
 
 ### Step 1: Upload Video
-1. Click "Select Video File" button
-2. Choose a video file (MP4, MOV, AVI, WebM)
-3. The app will automatically validate:
-   - File type (video formats only)
-   - File size (max 100MB)
-   - Duration (max 30 seconds)
 
-### Step 2: Preview Video
-- After successful upload, the video preview will appear
-- Duration and file size information will be displayed
-- The "Analyze Video" button will become enabled
+* Click **Select Video File** and choose an MP4, MOV, AVI, or WebM file
+* The app validates format, size (max 100MB), and duration (max 30s)
+* A video preview appears with duration and file size badges
 
-### Step 3: Configure API Key
-- On first analysis, you'll be prompted to enter your Google Gemini API key
-- The key will be stored for the session only
-- You can get a free API key from [Google AI Studio](https://makersuite.google.com/app/apikey)
+### Step 2: Wait for Model
 
-### Step 4: Analyze Video
-1. Click "Analyze Video for Fall Detection"
-2. The app will upload the video to Google Gemini AI
-3. Wait for the analysis to complete (typically 10-30 seconds)
+* The **Local ML Ready** badge (top-right of card) confirms MoveNet has loaded
+* Model loads automatically in the background when the page opens (~3–5 seconds)
 
-### Step 5: View Results
-The results will display:
-- **Fall Detected**: Yes/No with color coding
-- **Confidence**: Percentage with color indicators
-  - Green: 80-100% confidence
-  - Yellow: 50-79% confidence
-  - Red: 0-49% confidence
-- **Explanation**: Brief AI-generated explanation
+### Step 3: Analyze
 
-## API Integration Details
+* Click **Analyze Video for Fall Detection**
+* Watch the live status messages as the app works through each step:
+  * `Extracting frames (1/24)...`
+  * `Analyzing pose 3/24...`
+  * `Analyzing fall patterns...`
 
-### Google Gemini Pro Vision API
+### Step 4: View Results
 
-The application uses the `gemini-pro-vision` model with the following configuration:
+| Field                      | Description                                                     |
+| -------------------------- | --------------------------------------------------------------- |
+| **Fall Detected**    | Yes (red) / No (green) / Unknown (yellow)                       |
+| **Confidence**       | Green ≥ 75%, Yellow ≥ 50%, Red < 50%                          |
+| **Person Present**   | Whether a person was detected in the video                      |
+| **Engine**           | Which engine produced the result (Local ML or Gemini AI)        |
+| **Explanation**      | Human-readable summary of what was detected                     |
+| **Frames w/ Person** | How many of the 24 sampled frames contained a detectable person |
+| **Fall Pose Frames** | Frames where fall indicators were triggered                     |
+| **Drop Detected**    | Whether a sudden downward movement was found                    |
 
-```javascript
-// API Endpoint
-https://generativelanguage.googleapis.com/v1/models/gemini-pro-vision:generateContent
+### Gemini Fallback Prompt
 
-// Request Format
-{
-  "contents": [{
-    "parts": [
-      {"text": "Analysis prompt"},
-      {"inline_data": {
-        "mime_type": "video/mp4",
-        "data": "base64_encoded_video"
-      }}
-    ]
-  }]
-}
-```
+When local confidence is low, the app will ask:
 
-### API Response Format
-```json
-{
-  "fallDetected": "Yes" or "No",
-  "confidence": 0-100,
-  "explanation": "brief explanation",
-  "personPresent": "Yes" or "No"
-}
-```
+1. Whether you want to use Gemini for enhanced accuracy
+2. For your Gemini API key (stored in memory for the session only)
 
-### Prompt Engineering
-
-The system uses a structured prompt to ensure consistent JSON output:
-
-```
-Analyze this video and determine if a human fall accident has occurred.
-Please provide:
-1. Whether a fall is detected (Yes/No)
-2. Confidence percentage (0-100%)
-3. Brief explanation
-
-Format your response as JSON:
-{
-    "fallDetected": "Yes" or "No",
-    "confidence": number,
-    "explanation": "brief explanation"
-}
-```
+The local analysis context (fall frame ratio, peak score, drop detection) is passed to Gemini to help it produce a more informed response.
 
 ## File Structure
 
 ```
-zimozi_assignment/
-├── index.html          # Main HTML file
-├── styles.css          # Custom styling
-├── app.js             # Main application logic
-├── package.json       # Project metadata
-├── .gitignore         # Git ignore file
-└── README.md          # This documentation
+fall-detection-app/
+├── index.html        # UI — Bootstrap layout, TF.js + app script tags
+├── app.js            # Main application logic (3 classes below)
+│   ├── LocalFallDetector   — TF.js MoveNet pose analysis
+│   ├── GeminiAnalyzer      — Gemini File API upload + generateContent
+│   └── FallDetectionApp    — Orchestrator, UI, event handlers
+├── styles.css        # Custom styles
+└── README.md         # This file
 ```
 
 ## Error Handling
 
-The application implements comprehensive error handling for various scenarios:
+### File Errors
 
-### File Upload Errors
-- **Invalid File Type**: Shows error for non-video files
-- **Large File Size**: Rejects files over 100MB
-- **Duration Limit**: Rejects videos over 30 seconds
-- **Corrupted Files**: Handles corrupted or unreadable video files
-- **Empty Files**: Validates that files are not empty
+* Invalid type, size > 100MB, duration > 30s, empty file, corrupted file — all show specific messages
 
-### API Errors
-- **Invalid API Key**: Clear message for authentication failures
-- **Rate Limiting**: Handles API quota exceeded scenarios
-- **Service Unavailable**: Graceful handling of Google AI service outages
-- **Network Issues**: Automatic retry with exponential backoff
-- **Request Timeout**: 60-second timeout with user notification
+### ML Errors
 
-### Browser Compatibility
-- **Modern Browser Check**: Validates required APIs are available
-- **Video Support**: Ensures browser can handle video playback
-- **Fallback Messages**: User-friendly error display for unsupported browsers
+* TF.js CDN unavailable → falls back to Gemini automatically
+* Pose estimation failure on a frame → frame is skipped, analysis continues
 
-### Retry Logic
-- **Automatic Retries**: Up to 2 attempts for network-related errors
-- **Exponential Backoff**: 2s and 4s delays between retries
-- **Smart Error Detection**: Only retries recoverable errors
+### Gemini API Errors
 
-### User Experience
-- **Auto-hiding Errors**: Messages disappear after 10 seconds
-- **Manual Dismiss**: Close button for immediate dismissal
-- **Helpful Suggestions**: Guidance for common issues
-- **Non-blocking**: Errors don't crash the application
+* `401` Invalid API key
+* `403` Access forbidden
+* `429` Rate limit exceeded
+* `500+` Google service unavailable
+* Upload/processing timeout (after 30 polling attempts × 2s)
 
-## Security Considerations
+## Security
 
-- **API Key Storage**: API key is stored only in memory (session-based)
-- **File Validation**: Client-side validation for file types and sizes
-- **HTTPS Recommended**: Use HTTPS in production for API security
+* **No server required** : All local analysis runs in the browser
+* **API key in memory only** : Never stored to disk or localStorage
+* **Video privacy** : Video is only uploaded to Google if you explicitly choose Gemini enhancement
 
-## Assumptions and Limitations
+## Limitations
 
-### Assumptions
-1. User has a valid Google Gemini API key
-2. Video quality is sufficient for AI analysis
-3. Falls are visually detectable in the video
-4. Internet connection is available for API calls
-
-### Limitations
-1. **API Rate Limits**: Gemini API has usage quotas
-2. **Video Quality**: Poor lighting or camera angles may affect accuracy
-3. **Processing Time**: Analysis may take 10-30 seconds
-4. **Browser Support**: Requires modern browser with File API support
-5. **Single Analysis**: Only one video can be analyzed at a time
+1. **Pose visibility** : MoveNet requires a reasonably clear view of the person — heavy occlusion, very low resolution, or extreme camera angles reduce accuracy
+2. **Single person** : MoveNet SINGLEPOSE detects one person per frame; multi-person scenes use the most prominent pose
+3. **30-second limit** : Longer videos must be trimmed before upload
+4. **Gemini rate limits** : Free tier is 15 requests/minute; if exceeded, wait 60 seconds
 
 ## Browser Compatibility
 
-- ✅ Chrome 90+
-- ✅ Firefox 88+
-- ✅ Safari 14+
-- ✅ Edge 90+
+| Browser     | Local ML | Gemini Fallback |
+| ----------- | -------- | --------------- |
+| Chrome 90+  | ✅       | ✅              |
+| Firefox 88+ | ✅       | ✅              |
+| Safari 14+  | ✅       | ✅              |
+| Edge 90+    | ✅       | ✅              |
 
 ## Troubleshooting
 
-### Common Issues
+**Model badge stays on "Loading ML model..."**
+→ Check your internet connection; TF.js model weights load from CDN on first use (~8MB)
 
-**Q: "API request failed" error**
-A: Check your API key and ensure you have sufficient quota
+**Low confidence on valid fall videos**
+→ Ensure the person is clearly visible and the camera angle is not top-down; accept Gemini enhancement when prompted
 
-**Q: Video not uploading**
-A: Ensure video format is supported and file size is under 100MB
+**"Video processing timed out" (Gemini)**
+→ Google servers occasionally take longer on first upload; retry or use a shorter clip
 
-**Q: Analysis taking too long**
-A: Large videos may take longer; ensure stable internet connection
-
-**Q: Results seem inaccurate**
-A: Video quality and camera angle significantly affect AI accuracy
-
-### Debug Mode
-
-Open browser developer console (F12) to see:
-- API request/response details
-- Error messages
-- File processing information
+**Analysis button stays disabled**
+→ Video failed validation (duration, size, or format); check the error message
 
 ## Future Enhancements
 
-Potential improvements for future versions:
-1. **Multiple Video Support**: Batch processing capabilities
-2. **History Tracking**: Save analysis results
-3. **Advanced Filtering**: More sophisticated fall detection criteria
-4. **Real-time Processing**: Webcam integration for live monitoring
-5. **Export Features**: Download analysis reports
-
-## Support
-
-For issues or questions:
-1. Check the troubleshooting section above
-2. Verify your API key is valid and active
-3. Ensure all prerequisites are met
+* Multi-person detection (MoveNet MultiPose)
+* Webcam / live stream support
+* Batch video processing
+* Downloadable analysis report (PDF)
+* Alert/notification system for detected falls
 
 ## License
 
-This project is licensed under the MIT License.
-
----
-
-**Note**: This application is for demonstration purposes. For production use, consider implementing additional security measures, error handling, and user authentication.
+MIT License
