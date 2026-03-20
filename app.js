@@ -1,6 +1,6 @@
 class FallDetectionApp {
     constructor() {
-        this.apiKey = 'AIzaSyDb4wsWYJAO_fycbKuTF0kxmk2qDa6-U2A'; // Will be set by user
+        this.apiKey = ''; // Will be set by user
         this.selectedFile = null;
         this.maxFileSize = 100 * 1024 * 1024; // 100MB
         this.maxDuration = 30; // 30 seconds
