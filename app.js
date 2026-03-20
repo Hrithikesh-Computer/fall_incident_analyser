@@ -1,533 +1,687 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOCAL FALL DETECTOR — TensorFlow.js + MoveNet (runs fully in browser)
+// No API key needed. Analyzes pose landmarks frame-by-frame.
+// Gemini API is used only as a fallback when local confidence is low.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+class LocalFallDetector {
+    constructor() {
+        this.detector  = null;
+        this.isLoaded  = false;
+        this.isLoading = false;
+
+        // MoveNet keypoint indices (COCO-17 format)
+        this.KP = {
+            NOSE:           0,
+            LEFT_SHOULDER:  5,  RIGHT_SHOULDER: 6,
+            LEFT_HIP:      11,  RIGHT_HIP:      12,
+            LEFT_KNEE:     13,  RIGHT_KNEE:     14,
+            LEFT_ANKLE:    15,  RIGHT_ANKLE:    16,
+        };
+
+        this.THRESHOLDS = {
+            MIN_KEYPOINT_SCORE : 0.25,  // ignore low-confidence keypoints
+            FALL_ASPECT_RATIO  : 1.4,   // body bbox wider than tall → lying
+            FALL_HIP_HEIGHT    : 0.60,  // hip Y > 60% of frame → near ground
+            FALL_VERTICAL_SPAN : 0.38,  // shoulder-to-ankle span < 38% → horizontal
+            FALL_BODY_ANGLE    : 55,    // torso angle from vertical (degrees)
+            FALL_FRAME_RATIO   : 0.20,  // ≥20% of frames must show fall pose
+            FRAMES_TO_SAMPLE   : 24,    // frames to extract from video
+            MIN_SCORE_FOR_FALL : 45,    // minimum frame score to count as fall
+        };
+    }
+
+    // ── Load MoveNet model ────────────────────────────────────────────────────
+    async loadModel(onStatus) {
+        if (this.isLoaded)  return true;
+        if (this.isLoading) return false;
+
+        this.isLoading = true;
+        try {
+            if (typeof tf === 'undefined' || typeof poseDetection === 'undefined') {
+                throw new Error('TensorFlow.js libraries not loaded.');
+            }
+            if (onStatus) onStatus('Loading pose detection model...');
+
+            this.detector = await poseDetection.createDetector(
+                poseDetection.SupportedModels.MoveNet,
+                {
+                    modelType: poseDetection.movenet.modelType.SINGLEPOSE_THUNDER,
+                    enableSmoothing: false,
+                }
+            );
+            this.isLoaded  = true;
+            this.isLoading = false;
+            console.log('MoveNet model loaded successfully');
+            return true;
+        } catch (err) {
+            this.isLoading = false;
+            console.error('Failed to load MoveNet:', err);
+            return false;
+        }
+    }
+
+    // ── Main entry: analyze a video element ───────────────────────────────────
+    async analyze(videoElement, onStatus) {
+        if (!this.isLoaded) throw new Error('Model not loaded');
+
+        if (onStatus) onStatus('Extracting video frames...');
+        const frames = await this._extractFrames(videoElement, this.THRESHOLDS.FRAMES_TO_SAMPLE, onStatus);
+
+        if (onStatus) onStatus('Running pose estimation...');
+        const poseResults = await this._estimatePoses(frames, onStatus);
+
+        if (onStatus) onStatus('Analyzing fall patterns...');
+        return this._analyzeFallPatterns(poseResults, videoElement.duration);
+    }
+
+    // ── Extract N evenly-spaced frames from video ─────────────────────────────
+    async _extractFrames(video, numFrames, onStatus) {
+        const canvas   = document.getElementById('analysisCanvas');
+        const ctx      = canvas.getContext('2d');
+        const duration = video.duration;
+        const frames   = [];
+
+        video.pause();
+
+        for (let i = 0; i < numFrames; i++) {
+            const time = (duration / (numFrames - 1)) * i;
+            await this._seekTo(video, Math.min(time, duration - 0.05));
+
+            canvas.width  = video.videoWidth  || 640;
+            canvas.height = video.videoHeight || 480;
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+            const frameCanvas  = document.createElement('canvas');
+            frameCanvas.width  = canvas.width;
+            frameCanvas.height = canvas.height;
+            frameCanvas.getContext('2d').drawImage(canvas, 0, 0);
+
+            frames.push({ time, canvas: frameCanvas, width: canvas.width, height: canvas.height });
+            if (onStatus) onStatus(`Extracting frames... (${i + 1}/${numFrames})`);
+        }
+        return frames;
+    }
+
+    _seekTo(video, time) {
+        return new Promise((resolve) => {
+            const onSeeked = () => { video.removeEventListener('seeked', onSeeked); resolve(); };
+            video.addEventListener('seeked', onSeeked);
+            video.currentTime = time;
+            setTimeout(resolve, 1500); // safety timeout
+        });
+    }
+
+    // ── Run MoveNet on each frame canvas ─────────────────────────────────────
+    async _estimatePoses(frames, onStatus) {
+        const results = [];
+        for (let i = 0; i < frames.length; i++) {
+            const { time, canvas, width, height } = frames[i];
+            if (onStatus) onStatus(`Analyzing pose ${i + 1}/${frames.length}...`);
+            try {
+                const poses = await this.detector.estimatePoses(canvas, {
+                    maxPoses: 1,
+                    flipHorizontal: false,
+                    scoreThreshold: this.THRESHOLDS.MIN_KEYPOINT_SCORE,
+                });
+                results.push({ time, poses, width, height });
+            } catch (err) {
+                console.warn(`Pose estimation failed at frame ${i}:`, err);
+                results.push({ time, poses: [], width, height });
+            }
+        }
+        return results;
+    }
+
+    // ── Core fall analysis logic ──────────────────────────────────────────────
+    _analyzeFallPatterns(poseResults, videoDuration) {
+        const frameScores  = [];
+        const hipPositions = [];
+        let   personFrames = 0;
+
+        for (const { poses, width, height, time } of poseResults) {
+            if (!poses || poses.length === 0) continue;
+            const kps = poses[0].keypoints;
+            if (!this._hasSufficientKeypoints(kps)) continue;
+
+            personFrames++;
+            const metrics = this._computeMetrics(kps, width, height);
+            const score   = this._scoreFallFrame(metrics);
+            frameScores.push({ time, score, metrics });
+
+            if (metrics.hipY !== null) {
+                hipPositions.push({ time, y: metrics.hipY });
+            }
+        }
+
+        if (personFrames === 0) {
+            return {
+                fallDetected:  'No',
+                confidence:    85,
+                personPresent: 'No',
+                explanation:   'No person detected in any frame of the video.',
+                engine:        'Local ML (MoveNet)',
+                frameStats:    { total: poseResults.length, withPerson: 0 },
+            };
+        }
+
+        // Detect sudden downward drop in hip position
+        let dropDetected = false;
+        if (hipPositions.length >= 3) {
+            for (let i = 1; i < hipPositions.length; i++) {
+                if (hipPositions[i].y - hipPositions[i - 1].y > 0.18) {
+                    dropDetected = true;
+                    break;
+                }
+            }
+        }
+
+        const fallFrames     = frameScores.filter(f => f.score >= this.THRESHOLDS.MIN_SCORE_FOR_FALL);
+        const fallFrameRatio = fallFrames.length / personFrames;
+        const peakScore      = Math.max(...frameScores.map(f => f.score), 0);
+        const avgFallScore   = fallFrames.length
+            ? fallFrames.reduce((s, f) => s + f.score, 0) / fallFrames.length : 0;
+
+        const fallDetected = fallFrameRatio >= this.THRESHOLDS.FALL_FRAME_RATIO || peakScore >= 75;
+
+        let confidence;
+        if (fallDetected) {
+            confidence = Math.min(95, Math.round(
+                40 + (fallFrameRatio * 100) * 0.4 + avgFallScore * 0.2 + (dropDetected ? 10 : 0)
+            ));
+        } else {
+            confidence = Math.min(92, Math.round(
+                50 + (1 - fallFrameRatio) * 30 + (peakScore < 30 ? 15 : 0)
+            ));
+        }
+
+        return {
+            fallDetected:  fallDetected ? 'Yes' : 'No',
+            confidence,
+            personPresent: 'Yes',
+            explanation:   this._buildExplanation(fallDetected, fallFrames.length, personFrames, peakScore, dropDetected, frameScores),
+            engine:        'Local ML (MoveNet)',
+            frameStats: {
+                total:       poseResults.length,
+                withPerson:  personFrames,
+                fallFrames:  fallFrames.length,
+                fallRatio:   Math.round(fallFrameRatio * 100),
+                peakScore,
+                dropDetected,
+            },
+        };
+    }
+
+    _computeMetrics(kps, width, height) {
+        const get = (idx) => {
+            const kp = kps[idx];
+            return (kp && kp.score >= this.THRESHOLDS.MIN_KEYPOINT_SCORE)
+                ? { x: kp.x / width, y: kp.y / height } : null;
+        };
+
+        const shoulder = _midPoint(get(this.KP.LEFT_SHOULDER), get(this.KP.RIGHT_SHOULDER));
+        const hip      = _midPoint(get(this.KP.LEFT_HIP),      get(this.KP.RIGHT_HIP));
+        const ankle    = _midPoint(get(this.KP.LEFT_ANKLE),     get(this.KP.RIGHT_ANKLE));
+
+        const validKps = kps.filter(k => k.score >= this.THRESHOLDS.MIN_KEYPOINT_SCORE);
+        const xs = validKps.map(k => k.x / width);
+        const ys = validKps.map(k => k.y / height);
+        const bboxW = Math.max(...xs) - Math.min(...xs);
+        const bboxH = Math.max(...ys) - Math.min(...ys);
+
+        const verticalSpan = (shoulder && ankle) ? Math.abs(ankle.y - shoulder.y) : null;
+
+        let bodyAngle = null;
+        if (shoulder && hip) {
+            const dx = hip.x - shoulder.x;
+            const dy = hip.y - shoulder.y;
+            bodyAngle = Math.abs(90 - Math.abs(Math.atan2(dy, dx) * 180 / Math.PI));
+        }
+
+        return {
+            hipY:         hip      ? hip.y      : null,
+            shoulderY:    shoulder ? shoulder.y : null,
+            ankleY:       ankle    ? ankle.y    : null,
+            verticalSpan,
+            bodyAngle,
+            aspectRatio:  bboxH > 0.01 ? bboxW / bboxH : 0,
+            bboxH,
+        };
+    }
+
+    _scoreFallFrame(m) {
+        let score = 0;
+        if (m.aspectRatio > this.THRESHOLDS.FALL_ASPECT_RATIO)
+            score += Math.min(40, (m.aspectRatio - 1) * 20);
+        if (m.hipY !== null && m.hipY > this.THRESHOLDS.FALL_HIP_HEIGHT)
+            score += Math.min(30, (m.hipY - 0.5) * 60);
+        if (m.verticalSpan !== null && m.verticalSpan < this.THRESHOLDS.FALL_VERTICAL_SPAN)
+            score += Math.min(25, (0.5 - m.verticalSpan) * 50);
+        if (m.bodyAngle !== null && m.bodyAngle > this.THRESHOLDS.FALL_BODY_ANGLE)
+            score += Math.min(20, (m.bodyAngle - 45) * 0.5);
+        return Math.min(100, Math.round(score));
+    }
+
+    _hasSufficientKeypoints(kps) {
+        const required = [this.KP.LEFT_SHOULDER, this.KP.RIGHT_SHOULDER, this.KP.LEFT_HIP, this.KP.RIGHT_HIP];
+        return required.filter(idx => kps[idx] && kps[idx].score >= this.THRESHOLDS.MIN_KEYPOINT_SCORE).length >= 2;
+    }
+
+    _buildExplanation(fallDetected, fallFrameCount, personFrames, peakScore, dropDetected, frameScores) {
+        if (fallDetected) {
+            const parts = [`Fall detected across ${fallFrameCount} of ${personFrames} analyzed frames.`];
+            if (dropDetected)   parts.push('A sudden downward movement was detected.');
+            if (peakScore > 70) parts.push('Body posture indicates a horizontal position consistent with a fall.');
+            const worst = frameScores.reduce((a, b) => a.score > b.score ? a : b, frameScores[0]);
+            if (worst) parts.push(`Peak indicator at ${worst.time.toFixed(1)}s.`);
+            return parts.join(' ');
+        }
+        const reasons = [];
+        const maxAspect = Math.max(...frameScores.map(f => f.metrics.aspectRatio || 0));
+        if (maxAspect < 1.2) reasons.push('body remained upright throughout');
+        if (!dropDetected)   reasons.push('no sudden downward movement detected');
+        return `No fall detected. The person appears to be standing or moving normally${reasons.length ? ' — ' + reasons.join(', ') : ''}. Analysis covered ${personFrames} frames.`;
+    }
+}
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
+function _midPoint(a, b) {
+    if (a && b) return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+    return a || b || null;
+}
+
+function _delay(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function _parseJSON(raw) {
+    const cleaned = raw.replace(/```json|```/g, '').trim();
+    const match   = cleaned.match(/\{[\s\S]*\}/);
+    if (match) return JSON.parse(match[0]);
+    throw new Error('No JSON found in response');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GEMINI API — fallback when local confidence is low
+// ═══════════════════════════════════════════════════════════════════════════════
+
+class GeminiAnalyzer {
+    constructor(apiKey) {
+        this.apiKey    = apiKey;
+        this.apiTimeout = 60000;
+    }
+
+    async analyze(file, localContext, onStatus) {
+        if (onStatus) onStatus('Uploading video to Gemini...');
+        const fileUri = await this._uploadFile(file, onStatus);
+
+        if (onStatus) onStatus('Running AI fall analysis (Gemini)...');
+        const prompt = `Analyze this video for human fall detection.
+Context from local pose analysis: ${localContext}
+
+Respond ONLY with JSON (no markdown):
+{
+  "fallDetected": "Yes" or "No",
+  "confidence": number (0-100),
+  "explanation": "brief explanation",
+  "personPresent": "Yes" or "No"
+}`;
+
+        const controller = new AbortController();
+        const tid = setTimeout(() => controller.abort(), this.apiTimeout);
+
+        const resp = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${this.apiKey}`,
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    contents: [{
+                        parts: [
+                            { text: prompt },
+                            { file_data: { mime_type: file.type || 'video/mp4', file_uri: fileUri } }
+                        ]
+                    }]
+                }),
+                signal: controller.signal
+            }
+        );
+        clearTimeout(tid);
+
+        if (resp.status === 429) throw new Error('Gemini rate limit exceeded. Please wait a moment and try again.');
+        if (resp.status === 401) throw new Error('Invalid Gemini API key. Please check your key and try again.');
+        if (resp.status === 403) throw new Error('Gemini API access forbidden. Check your API key permissions.');
+        if (!resp.ok) { const t = await resp.text(); throw new Error(`Gemini error (${resp.status}): ${t}`); }
+
+        const data = await resp.json();
+        if (!data.candidates?.[0]?.content) throw new Error('Invalid response from Gemini.');
+
+        const text   = data.candidates[0].content.parts[0].text;
+        const parsed = _parseJSON(text);
+        parsed.engine = 'Gemini AI';
+        return parsed;
+    }
+
+    async _uploadFile(file, onStatus) {
+        const mimeType     = file.type || 'video/mp4';
+        const boundary     = '-------' + Date.now().toString(16);
+        const metadataJson = JSON.stringify({ file: { display_name: file.name } });
+        const fileBuffer   = await file.arrayBuffer();
+        const encoder      = new TextEncoder();
+
+        const metaPart = encoder.encode(`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${metadataJson}\r\n`);
+        const filePart = encoder.encode(`--${boundary}\r\nContent-Type: ${mimeType}\r\n\r\n`);
+        const closing  = encoder.encode(`\r\n--${boundary}--`);
+
+        const body = new Uint8Array(metaPart.byteLength + filePart.byteLength + fileBuffer.byteLength + closing.byteLength);
+        let off = 0;
+        body.set(metaPart,                   off); off += metaPart.byteLength;
+        body.set(filePart,                   off); off += filePart.byteLength;
+        body.set(new Uint8Array(fileBuffer), off); off += fileBuffer.byteLength;
+        body.set(closing,                    off);
+
+        const resp = await fetch(
+            `https://generativelanguage.googleapis.com/upload/v1beta/files?uploadType=multipart&key=${this.apiKey}`,
+            { method: 'POST', headers: { 'Content-Type': `multipart/related; boundary=${boundary}` }, body }
+        );
+        if (!resp.ok) { const t = await resp.text(); throw new Error(`Upload failed: ${t}`); }
+
+        const { file: f } = await resp.json();
+        if (!f?.name) throw new Error('No file name returned from upload.');
+        return await this._waitForFile(f.name, onStatus);
+    }
+
+    async _waitForFile(fileName, onStatus) {
+        for (let i = 0; i < 30; i++) {
+            await _delay(2000);
+            if (onStatus) onStatus(`Processing video on Google... (${i + 1}/30)`);
+            const res  = await fetch(`https://generativelanguage.googleapis.com/v1beta/${fileName}?key=${this.apiKey}`);
+            if (!res.ok) continue;
+            const data = await res.json();
+            if (data.state === 'ACTIVE') return data.uri;
+            if (data.state === 'FAILED') throw new Error('Video processing failed on Google servers.');
+        }
+        throw new Error('Video processing timed out.');
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MAIN APP
+// ═══════════════════════════════════════════════════════════════════════════════
+
 class FallDetectionApp {
     constructor() {
-        this.apiKey = ''; // Will be set by user
-        this.selectedFile = null;
-        this.maxFileSize = 100 * 1024 * 1024; // 100MB
-        this.maxDuration = 30; // 30 seconds
-        this.apiTimeout = 60000; // 60 seconds
-        this.retryAttempts = 2;
-        this.currentRetry = 0;
-        
+        this.geminiApiKey  = '';
+        this.gemini        = null;
+        this.selectedFile  = null;
+        this.localDetector = new LocalFallDetector();
+        this.maxFileSize   = 100 * 1024 * 1024; // 100MB
+        this.maxDuration   = 30;                // seconds
+        this.modelReady    = false;
+
+        // Confidence below this → escalate to Gemini
+        this.AI_ESCALATION_THRESHOLD = 55;
+
         try {
             this.initializeEventListeners();
             this.validateBrowserSupport();
-        } catch (error) {
-            console.error('Initialization error:', error);
+            this._preloadModel();
+        } catch (err) {
+            console.error('Init error:', err);
             this.showError('Failed to initialize application. Please refresh the page.');
         }
     }
 
+    async _preloadModel() {
+        this.updateModelStatus('loading');
+        const ok = await this.localDetector.loadModel();
+        this.modelReady = ok;
+        this.updateModelStatus(ok ? 'ready' : 'failed');
+        if (!ok) console.warn('MoveNet failed to load — will rely on Gemini fallback.');
+    }
+
+    updateModelStatus(state) {
+        const el  = $('#modelStatus');
+        if (!el.length) return;
+        const map = {
+            loading: ['bg-warning text-dark', 'bi-hourglass-split', 'Loading ML model...'],
+            ready:   ['bg-success text-white', 'bi-cpu',            'Local ML Ready'],
+            failed:  ['bg-secondary text-white', 'bi-cloud',        'API Mode Only'],
+        };
+        const [cls, icon, text] = map[state] || map.failed;
+        el.attr('class', `badge ${cls}`).html(`<i class="bi ${icon} me-1"></i>${text}`);
+    }
+
     initializeEventListeners() {
-        try {
-            if (!$('#videoUpload').length) {
-                throw new Error('Video upload element not found');
-            }
-            if (!$('#analyzeBtn').length) {
-                throw new Error('Analyze button element not found');
-            }
-            
-            $('#videoUpload').on('change', (e) => {
-                try {
-                    this.handleFileSelect(e);
-                } catch (error) {
-                    console.error('File selection error:', error);
-                    this.showError('Error selecting file. Please try again.');
-                    this.resetFileInput();
-                }
-            });
-            
-            $('#analyzeBtn').on('click', () => {
-                try {
-                    this.analyzeVideo();
-                } catch (error) {
-                    console.error('Analysis trigger error:', error);
-                    this.showError('Error starting analysis. Please try again.');
-                }
-            });
-            
-            $('#previewPlayer').on('error', (e) => {
-                console.error('Video preview error:', e);
-                this.showError('Error loading video preview. The file may be corrupted.');
-                this.hideVideoPreview();
-                this.resetFileInput();
-            });
-            
-        } catch (error) {
-            console.error('Event listener initialization error:', error);
-            throw error;
-        }
+        if (!$('#videoUpload').length) throw new Error('videoUpload element not found');
+        if (!$('#analyzeBtn').length)  throw new Error('analyzeBtn element not found');
+
+        $('#videoUpload').on('change', (e) => {
+            try   { this.handleFileSelect(e); }
+            catch (err) { this.showError(err.message || 'Error selecting file.'); this.resetFileInput(); }
+        });
+
+        $('#analyzeBtn').on('click', () => {
+            try   { this.analyzeVideo(); }
+            catch (err) { this.showError(err.message || 'Error starting analysis.'); }
+        });
+
+        $('#previewPlayer').on('error', () => {
+            this.showError('Error loading video preview. The file may be corrupted.');
+            this.hideVideoPreview(); this.resetFileInput();
+        });
     }
 
     handleFileSelect(event) {
-        try {
-            const file = event.target.files[0];
-            if (!file) {
-                this.hideVideoPreview();
-                return;
-            }
-
-            if (!(file instanceof File)) {
-                throw new Error('Invalid file object');
-            }
-
-            if (!file.name || typeof file.name !== 'string') {
-                throw new Error('Invalid file name');
-            }
-
-            if (!this.isVideoFile(file)) {
-                throw new Error('Please select a valid video file (MP4, MOV, AVI, WebM).');
-            }
-
-            if (file.size > this.maxFileSize) {
-                throw new Error(`File size must be less than ${this.maxFileSize / (1024 * 1024)}MB.`);
-            }
-            
-            if (file.size === 0) {
-                throw new Error('File is empty. Please select a valid video file.');
-            }
-
-            this.selectedFile = file;
-            this.showVideoPreview(file);
-            this.hideError();
-            
-        } catch (error) {
-            console.error('File selection error:', error);
-            this.showError(error.message || 'Error selecting file. Please try again.');
-            this.resetFileInput();
-        }
+        const file = event.target.files[0];
+        if (!file) { this.hideVideoPreview(); return; }
+        if (!(file instanceof File))      throw new Error('Invalid file object.');
+        if (!this.isVideoFile(file))      throw new Error('Please select a valid video file (MP4, MOV, AVI, WebM).');
+        if (file.size > this.maxFileSize) throw new Error(`File too large. Max ${this.maxFileSize / (1024 * 1024)}MB.`);
+        if (file.size === 0)              throw new Error('File is empty.');
+        this.selectedFile = file;
+        this.showVideoPreview(file);
+        this.hideError();
     }
 
     isVideoFile(file) {
-        const validTypes = ['video/mp4', 'video/mov', 'video/avi', 'video/webm', 'video/quicktime'];
-        return validTypes.includes(file.type) || file.name.match(/\.(mp4|mov|avi|webm)$/i);
+        const validTypes = ['video/mp4','video/mov','video/avi','video/webm','video/quicktime'];
+        return validTypes.includes(file.type) || /\.(mp4|mov|avi|webm)$/i.test(file.name);
     }
 
     showVideoPreview(file) {
-        try {
-            const video = document.getElementById('previewPlayer');
-            if (!video) {
-                throw new Error('Video preview element not found');
-            }
-            
-            if (video.src && video.src.startsWith('blob:')) {
-                URL.revokeObjectURL(video.src);
-            }
-            
-            const url = URL.createObjectURL(file);
-            video.src = url;
-            
-            const videoErrorHandler = (e) => {
-                console.error('Video loading error:', e);
-                this.showError('Error loading video. The file may be corrupted or in an unsupported format.');
-                this.hideVideoPreview();
-                this.resetFileInput();
-                URL.revokeObjectURL(url);
-            };
-            
-            video.onerror = videoErrorHandler;
-            
-            video.onloadedmetadata = () => {
-                try {
-                    if (!video.duration || isNaN(video.duration)) {
-                        throw new Error('Unable to determine video duration.');
-                    }
-                    
-                    const duration = video.duration;
-                    const fileSize = (file.size / (1024 * 1024)).toFixed(2);
-                    
-                    if (duration > this.maxDuration) {
-                        throw new Error(`Video duration must be ${this.maxDuration} seconds or less. Current duration: ${duration.toFixed(1)}s`);
-                    }
-                    
-                    if (duration < 1) {
-                        throw new Error('Video duration is too short. Please select a video at least 1 second long.');
-                    }
+        const video = document.getElementById('previewPlayer');
+        if (!video) throw new Error('previewPlayer element not found');
+        if (video.src?.startsWith('blob:')) URL.revokeObjectURL(video.src);
 
-                    $('#videoDuration').text(`Duration: ${duration.toFixed(1)}s`);
-                    $('#videoSize').text(`Size: ${fileSize}MB`);
-                    $('#videoPreview').show();
-                    $('#analyzeBtn').prop('disabled', false);
-                    
-                } catch (error) {
-                    console.error('Video metadata error:', error);
-                    this.showError(error.message || 'Error processing video metadata.');
-                    this.hideVideoPreview();
-                    this.resetFileInput();
-                    URL.revokeObjectURL(url);
-                }
-            };
-            
-            setTimeout(() => {
-                if (video.readyState === 0) {
-                    videoErrorHandler(new Error('Video loading timeout'));
-                }
-            }, 10000);
-            
-        } catch (error) {
-            console.error('Video preview error:', error);
-            this.showError(error.message || 'Error creating video preview.');
-            this.hideVideoPreview();
-            this.resetFileInput();
-        }
+        const url = URL.createObjectURL(file);
+        video.src = url;
+
+        video.onerror = () => {
+            this.showError('Error loading video. File may be corrupted.');
+            this.hideVideoPreview(); this.resetFileInput(); URL.revokeObjectURL(url);
+        };
+
+        video.onloadedmetadata = () => {
+            try {
+                if (!video.duration || isNaN(video.duration)) throw new Error('Cannot determine video duration.');
+                if (video.duration > this.maxDuration) throw new Error(`Video must be ${this.maxDuration}s or less (current: ${video.duration.toFixed(1)}s).`);
+                if (video.duration < 1)                throw new Error('Video too short (minimum 1 second).');
+
+                $('#videoDuration').text(`Duration: ${video.duration.toFixed(1)}s`);
+                $('#videoSize').text(`Size: ${(file.size / (1024 * 1024)).toFixed(2)}MB`);
+                $('#videoPreview').show();
+                $('#analyzeBtn').prop('disabled', false);
+            } catch (err) {
+                this.showError(err.message);
+                this.hideVideoPreview(); this.resetFileInput(); URL.revokeObjectURL(url);
+            }
+        };
+
+        setTimeout(() => {
+            if (video.readyState === 0) {
+                this.showError('Video loading timeout. Try a different file.');
+                this.hideVideoPreview(); this.resetFileInput();
+            }
+        }, 10000);
     }
 
     hideVideoPreview() {
-        try {
-            $('#videoPreview').hide();
-            $('#analyzeBtn').prop('disabled', true);
-            
-            const video = document.getElementById('previewPlayer');
-            if (video && video.src && video.src.startsWith('blob:')) {
-                URL.revokeObjectURL(video.src);
-                video.src = '';
-            }
-            
-            this.selectedFile = null;
-        } catch (error) {
-            console.error('Error hiding video preview:', error);
-        }
+        $('#videoPreview').hide();
+        $('#analyzeBtn').prop('disabled', true);
+        const v = document.getElementById('previewPlayer');
+        if (v?.src?.startsWith('blob:')) { URL.revokeObjectURL(v.src); v.src = ''; }
+        this.selectedFile = null;
     }
 
     async analyzeVideo() {
         try {
-            if (!this.selectedFile) {
-                throw new Error('Please select a video file first.');
-            }
-
-            if (!this.apiKey) {
-                const apiKey = prompt('Please enter your Google Gemini API Key:');
-                if (!apiKey || apiKey.trim() === '') {
-                    throw new Error('API Key is required for analysis.');
-                }
-                if (!apiKey.match(/^[a-zA-Z0-9_-]+$/)) {
-                    throw new Error('Invalid API Key format. Please check your key and try again.');
-                }
-                this.apiKey = apiKey.trim();
-            }
-
+            if (!this.selectedFile) throw new Error('Please select a video file first.');
             this.showLoading(true);
             this.hideError();
             this.hideResults();
-            this.currentRetry = 0;
-
-            await this.performAnalysis();
-            
-        } catch (error) {
-            console.error('Analysis error:', error);
-            this.showError(error.message || 'Failed to analyze video. Please try again.');
+            await this._runAnalysis();
+        } catch (err) {
+            console.error('Analysis error:', err);
+            this.showError(err.message || 'Failed to analyze video. Please try again.');
         } finally {
             this.showLoading(false);
         }
     }
-    
-    async performAnalysis() {
-        try {
-            // Use File API instead of base64 to avoid token quota issues
-            const analysis = await this.callGeminiAPI();
-            this.displayResults(analysis);
-        } catch (error) {
-            console.error('Analysis attempt failed:', error);
-            
-            if (this.currentRetry < this.retryAttempts && this.isRetryableError(error)) {
-                this.currentRetry++;
-                console.log(`Retrying analysis (attempt ${this.currentRetry}/${this.retryAttempts})`);
-                await this.delay(5000 * this.currentRetry); // 5s, 10s backoff
-                return this.performAnalysis();
-            }
-            
-            throw error;
-        }
-    }
 
-    // ─── Step 1: Upload video using multipart upload (browser CORS compatible) ─
-    async uploadVideoFile(file) {
-        this.updateLoadingMessage('Uploading video to Google...');
+    // ── Analysis pipeline: Local ML first → Gemini if confidence is low ───────
+    async _runAnalysis() {
+        const video = document.getElementById('previewPlayer');
+        let localResult = null;
 
-        const mimeType = file.type || 'video/mp4';
-        const boundary = '-------' + Date.now().toString(16);
-        const metadataJson = JSON.stringify({ file: { display_name: file.name } });
-
-        // Read file as ArrayBuffer for binary part
-        const fileBuffer = await file.arrayBuffer();
-
-        // Build multipart body manually so binary data isn't corrupted
-        const encoder = new TextEncoder();
-        const metadataPart = encoder.encode(
-            `--${boundary}\r\n` +
-            `Content-Type: application/json; charset=UTF-8\r\n\r\n` +
-            `${metadataJson}\r\n`
-        );
-        const filePart = encoder.encode(
-            `--${boundary}\r\n` +
-            `Content-Type: ${mimeType}\r\n\r\n`
-        );
-        const closingBoundary = encoder.encode(`\r\n--${boundary}--`);
-
-        // Combine all parts into one Uint8Array
-        const body = new Uint8Array(
-            metadataPart.byteLength +
-            filePart.byteLength +
-            fileBuffer.byteLength +
-            closingBoundary.byteLength
-        );
-        let offset = 0;
-        body.set(metadataPart, offset);                offset += metadataPart.byteLength;
-        body.set(filePart, offset);                    offset += filePart.byteLength;
-        body.set(new Uint8Array(fileBuffer), offset);  offset += fileBuffer.byteLength;
-        body.set(closingBoundary, offset);
-
-        const response = await fetch(
-            `https://generativelanguage.googleapis.com/upload/v1beta/files?uploadType=multipart&key=${this.apiKey}`,
-            {
-                method: 'POST',
-                headers: {
-                    'Content-Type': `multipart/related; boundary=${boundary}`,
-                },
-                body: body
-            }
-        );
-
-        if (!response.ok) {
-            const errText = await response.text();
-            console.error('Upload failed:', errText);
-            if (response.status === 401) throw new Error('Invalid API key. Please check your Gemini API key.');
-            if (response.status === 403) throw new Error('API access forbidden. Check your API key permissions.');
-            if (response.status === 429) throw new Error('API rate limit exceeded. Please wait a minute and try again.');
-            throw new Error(`Failed to upload video: ${errText}`);
-        }
-
-        const uploadData = await response.json();
-        const fileName = uploadData?.file?.name;
-        if (!fileName) throw new Error('No file name returned after upload. Please try again.');
-
-        // Wait for Google to finish processing the video
-        return await this.waitForFileProcessing(fileName);
-    }
-
-    // ─── Step 2: Poll until file state is ACTIVE ──────────────────────────────
-    async waitForFileProcessing(fileName) {
-        this.updateLoadingMessage('Processing video on Google servers...');
-        const maxAttempts = 30;
-
-        for (let i = 0; i < maxAttempts; i++) {
-            await this.delay(2000);
-
-            const res = await fetch(
-                `https://generativelanguage.googleapis.com/v1beta/${fileName}?key=${this.apiKey}`
-            );
-
-            if (!res.ok) {
-                console.warn('File status check failed, retrying...');
-                continue;
-            }
-
-            const data = await res.json();
-
-            if (data.state === 'ACTIVE') {
-                console.log('File ready for analysis:', data.uri);
-                return data.uri;
-            }
-
-            if (data.state === 'FAILED') {
-                throw new Error('Video processing failed on Google servers. Please try a different video.');
-            }
-
-            this.updateLoadingMessage(`Processing video... (${i + 1}/${maxAttempts})`);
-        }
-
-        throw new Error('Video processing timed out. Please try a shorter or smaller video.');
-    }
-
-    // ─── Step 3: Analyze using file_data reference (no base64) ───────────────
-    async callGeminiAPI() {
-        try {
-            if (!this.apiKey || typeof this.apiKey !== 'string') {
-                throw new Error('API key is required');
-            }
-
-            // Upload video first via File API
-            this.updateLoadingMessage('Uploading video to Google...');
-            const fileUri = await this.uploadVideoFile(this.selectedFile);
-
-            const prompt = `Analyze this video and determine if a human fall accident has occurred. 
-            Please provide:
-            1. Whether a fall is detected (Yes/No)
-            2. Confidence percentage (0-100%)
-            3. Brief explanation
-            4. Whether a person is present (Yes/No)
-            
-            Format your response as JSON only, no markdown:
-            {
-                "fallDetected": "Yes" or "No",
-                "confidence": number,
-                "explanation": "brief explanation",
-                "personPresent": "Yes" or "No"
-            }`;
-
-            const requestBody = {
-                contents: [{
-                    parts: [
-                        { text: prompt },
-                        {
-                            file_data: {
-                                mime_type: this.selectedFile.type || 'video/mp4',
-                                file_uri: fileUri
-                            }
-                        }
-                    ]
-                }]
-            };
-
-            this.updateLoadingMessage('Analyzing video for falls...');
-
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), this.apiTimeout);
-
-            const response = await fetch(
-                `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${this.apiKey}`,
-                {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(requestBody),
-                    signal: controller.signal
-                }
-            );
-
-            clearTimeout(timeoutId);
-
-            if (!response.ok) {
-                const errorText = await response.text();
-                let errorMessage = `API request failed: ${errorText}`;
-
-                if (response.status === 400) {
-                    errorMessage = 'Invalid request. The video file may be corrupted or in an unsupported format.';
-                } else if (response.status === 401) {
-                    errorMessage = 'Invalid API key. Please check your Gemini API key and try again.';
-                } else if (response.status === 403) {
-                    errorMessage = 'API access forbidden. Your API key may not have access to the Gemini API.';
-                } else if (response.status === 429) {
-                    errorMessage = 'API rate limit exceeded. Please wait a minute and try again.';
-                } else if (response.status >= 500) {
-                    errorMessage = 'Google AI service is currently unavailable. Please try again later.';
-                }
-
-                console.error('API Error Response:', errorText);
-                throw new Error(errorMessage);
-            }
-
-            const data = await response.json();
-
-            if (!data.candidates || !data.candidates[0] || !data.candidates[0].content) {
-                throw new Error('Invalid API response structure');
-            }
-
-            const text = data.candidates[0].content.parts[0].text;
-
-            if (!text || typeof text !== 'string') {
-                throw new Error('Empty or invalid response from AI model');
-            }
-
-            // Strip markdown code fences if present then parse JSON
+        // ── Step 1: Local ML ──────────────────────────────────────────────────
+        if (this.modelReady) {
             try {
-                const clean = text.replace(/```json|```/g, '').trim();
-                const parsed = JSON.parse(clean);
-                this.validateAnalysisResult(parsed);
-                return parsed;
-            } catch (parseError) {
-                console.warn('JSON parsing failed, using fallback:', parseError);
-                return this.parseTextResponse(text);
-            }
+                if (!this.localDetector.isLoaded) {
+                    this.updateLoadingMessage('Loading ML model...');
+                    await this.localDetector.loadModel((msg) => this.updateLoadingMessage(msg));
+                }
 
-        } catch (error) {
-            if (error.name === 'AbortError') {
-                throw new Error('Request timeout. The analysis is taking too long. Please try again.');
+                localResult = await this.localDetector.analyze(
+                    video,
+                    (msg) => this.updateLoadingMessage(msg)
+                );
+                console.log('Local result:', localResult);
+
+                // High confidence → done, show result
+                if (localResult.confidence >= this.AI_ESCALATION_THRESHOLD) {
+                    this.displayResults(localResult);
+                    return;
+                }
+
+                // Low confidence → try Gemini
+                this.updateLoadingMessage(`Local confidence low (${localResult.confidence}%) — enhancing with Gemini...`);
+            } catch (localErr) {
+                console.warn('Local detection failed:', localErr);
+                this.updateLoadingMessage('Local ML failed — switching to Gemini...');
             }
-            throw error;
+        } else {
+            this.updateLoadingMessage('ML model unavailable — using Gemini...');
+        }
+
+        // ── Step 2: Gemini fallback ───────────────────────────────────────────
+        const geminiResult = await this._tryGemini(localResult);
+        if (geminiResult) {
+            this.displayResults(geminiResult);
+            return;
+        }
+
+        // ── Step 3: If Gemini skipped/unavailable, show local result anyway ───
+        if (localResult) {
+            localResult.explanation += ' (Note: AI enhancement was unavailable — confidence may be lower than optimal.)';
+            this.displayResults(localResult);
+            return;
+        }
+
+        throw new Error('All analysis methods failed. Please check your setup and try again.');
+    }
+
+    // ── Collect Gemini key if needed, run analysis ─────────────────────────────
+    async _tryGemini(localResult) {
+        if (!this.geminiApiKey) {
+            const wantAI = confirm(
+                `Local ML confidence is ${localResult ? localResult.confidence + '%' : 'unavailable'}.\n\n` +
+                `Would you like to enhance accuracy using the Gemini API?\n\n` +
+                `Press OK to enter your API key, or Cancel to use the local result.`
+            );
+            if (!wantAI) return null;
+
+            const key = prompt('Enter your Google Gemini API Key:');
+            if (!key?.trim()) return null;
+            if (!/^[a-zA-Z0-9_-]+$/.test(key.trim())) {
+                this.showError('Invalid Gemini API key format.');
+                return null;
+            }
+            this.geminiApiKey = key.trim();
+        }
+
+        if (!this.gemini) {
+            this.gemini = new GeminiAnalyzer(this.geminiApiKey);
+        }
+
+        try {
+            const localContext = localResult
+                ? `fallDetected=${localResult.fallDetected}, confidence=${localResult.confidence}%, frameStats=${JSON.stringify(localResult.frameStats)}`
+                : 'No local analysis available.';
+
+            return await this.gemini.analyze(
+                this.selectedFile,
+                localContext,
+                (msg) => this.updateLoadingMessage(msg)
+            );
+        } catch (err) {
+            console.error('Gemini failed:', err);
+            this.showError(`Gemini error: ${err.message}`);
+            return null;
         }
     }
 
-    parseTextResponse(text) {
-        try {
-            if (!text || typeof text !== 'string') {
-                throw new Error('Invalid text response');
-            }
-            
-            const fallMatch = text.match(/fall\s*detected\s*:\s*(yes|no)/i);
-            const confidenceMatch = text.match(/confidence\s*:\s*(\d+)%?/i);
-            const personMatch = text.match(/person\s*present\s*:\s*(yes|no)/i);
-            
-            const fallDetected = fallMatch ? 
-                fallMatch[1].charAt(0).toUpperCase() + fallMatch[1].slice(1) : 'Unknown';
-            const confidence = confidenceMatch ? parseInt(confidenceMatch[1]) : 0;
-            const personPresent = personMatch ? 
-                personMatch[1].charAt(0).toUpperCase() + personMatch[1].slice(1) : 'Unknown';
-            const explanation = text.length > 200 ? 
-                text.substring(0, 200) + '...' : text;
-            
-            return {
-                fallDetected,
-                confidence: Math.min(100, Math.max(0, confidence)),
-                explanation,
-                personPresent
-            };
-        } catch (error) {
-            console.error('Text parsing error:', error);
-            return {
-                fallDetected: 'Unknown',
-                confidence: 0,
-                explanation: 'Unable to parse AI response. Please try again.',
-                personPresent: 'Unknown'
-            };
+    displayResults(result) {
+        const fd  = ['Yes','No','Unknown'].includes(result.fallDetected)  ? result.fallDetected  : 'Unknown';
+        const pp  = ['Yes','No','Unknown'].includes(result.personPresent) ? result.personPresent : 'Unknown';
+        const con = Math.min(100, Math.max(0, parseInt(result.confidence) || 0));
+        const exp = String(result.explanation || 'No explanation provided.').substring(0, 600);
+
+        $('#fallResult')
+            .text(fd)
+            .removeClass('bg-success bg-danger bg-warning')
+            .addClass(fd === 'Yes' ? 'bg-danger' : fd === 'No' ? 'bg-success' : 'bg-warning');
+
+        $('#confidenceResult')
+            .text(`${con}%`)
+            .removeClass('bg-success bg-danger bg-warning')
+            .addClass(con >= 75 ? 'bg-success' : con >= 50 ? 'bg-warning' : 'bg-danger');
+
+        $('#explanationResult').text(exp);
+
+        if ($('#personPresentResult').length) {
+            $('#personPresentResult')
+                .text(pp)
+                .removeClass('bg-info bg-secondary')
+                .addClass(pp === 'Yes' ? 'bg-info' : 'bg-secondary');
         }
-    }
 
-    displayResults(analysis) {
-        try {
-            if (!analysis || typeof analysis !== 'object') {
-                throw new Error('Invalid analysis data');
-            }
-            
-            const fallDetected = analysis.fallDetected || 'Unknown';
-            const confidence = analysis.confidence || 0;
-            const explanation = analysis.explanation || 'No explanation provided.';
-            const personPresent = analysis.personPresent || 'Unknown';
-
-            const validFallDetected = ['Yes', 'No', 'Unknown'].includes(fallDetected) ? fallDetected : 'Unknown';
-            const validConfidence = Math.min(100, Math.max(0, parseInt(confidence) || 0));
-            const validExplanation = String(explanation).substring(0, 500);
-            const validPersonPresent = ['Yes', 'No', 'Unknown'].includes(personPresent) ? personPresent : 'Unknown';
-
-            $('#fallResult')
-                .text(validFallDetected)
-                .removeClass('bg-success bg-danger bg-warning')
-                .addClass(validFallDetected === 'Yes' ? 'bg-danger' : 
-                         validFallDetected === 'No' ? 'bg-success' : 'bg-warning');
-
-            $('#confidenceResult')
-                .text(`${validConfidence}%`)
-                .removeClass('bg-success bg-danger bg-warning')
-                .addClass(validConfidence >= 80 ? 'bg-success' : 
-                         validConfidence >= 50 ? 'bg-warning' : 'bg-danger');
-
-            $('#explanationResult').text(validExplanation);
-            
-            if ($('#personPresentResult').length) {
-                $('#personPresentResult')
-                    .text(validPersonPresent)
-                    .removeClass('bg-success bg-danger bg-warning')
-                    .addClass(validPersonPresent === 'Yes' ? 'bg-info' : 'bg-secondary');
-            }
-            
-            $('#resultsSection').show();
-            
-        } catch (error) {
-            console.error('Error displaying results:', error);
-            this.showError('Error displaying analysis results. Please try again.');
+        if ($('#engineResult').length) {
+            $('#engineResult').text(result.engine || 'Unknown');
         }
+
+        if (result.frameStats && $('#frameStatsSection').length) {
+            const s = result.frameStats;
+            $('#frameStatsSection').show();
+            $('#statFrames').text(`${s.withPerson} / ${s.total}`);
+            $('#statFallFrames').text(`${s.fallFrames || 0} (${s.fallRatio || 0}%)`);
+            $('#statDrop').text(s.dropDetected ? 'Yes ⚠️' : 'No');
+        }
+
+        $('#resultsSection').show();
     }
 
     hideResults() {
         $('#resultsSection').hide();
+        $('#frameStatsSection').hide();
     }
 
     showLoading(show) {
@@ -545,141 +699,49 @@ class FallDetectionApp {
         }
     }
 
-    // Updates the loading message during multi-step process
-    updateLoadingMessage(message) {
-        try {
-            $('#loadingMessage').text(message);
-            console.log('Status:', message);
-        } catch (e) {
-            console.log('Status:', message);
-        }
+    updateLoadingMessage(msg) {
+        $('#loadingMessage').text(msg);
+        console.log('Status:', msg);
     }
 
     showError(message) {
-        try {
-            if (!message || typeof message !== 'string') {
-                message = 'An unknown error occurred.';
-            }
-            
-            $('#errorMessage').text(message);
-            $('#errorAlert').show();
-            
-            setTimeout(() => {
-                this.hideError();
-            }, 10000);
-            
-        } catch (error) {
-            console.error('Error showing error message:', error);
-            alert(message || 'An error occurred');
-        }
+        const msg = (message && typeof message === 'string') ? message : 'An unknown error occurred.';
+        $('#errorMessage').text(msg);
+        $('#errorAlert').show();
+        setTimeout(() => this.hideError(), 12000);
     }
 
-    hideError() {
-        $('#errorAlert').hide();
-    }
-    
+    hideError() { $('#errorAlert').hide(); }
+
     resetFileInput() {
-        try {
-            $('#videoUpload').val('');
-            this.hideVideoPreview();
-        } catch (error) {
-            console.error('Error resetting file input:', error);
-        }
+        try { $('#videoUpload').val(''); this.hideVideoPreview(); } catch (_) {}
     }
-    
+
     validateBrowserSupport() {
-        try {
-            if (!window.File || !window.FileReader || !window.URL) {
-                throw new Error('Your browser does not support required file APIs. Please update your browser.');
-            }
-            
-            if (!window.fetch) {
-                throw new Error('Your browser does not support the Fetch API. Please update your browser.');
-            }
-            
-            const video = document.createElement('video');
-            if (!video.canPlayType) {
-                throw new Error('Your browser does not support video playback.');
-            }
-            
-            console.log('Browser compatibility check passed');
-            
-        } catch (error) {
-            console.error('Browser compatibility error:', error);
-            throw error;
-        }
-    }
-    
-    validateAnalysisResult(result) {
-        if (!result || typeof result !== 'object') {
-            throw new Error('Invalid analysis result format');
-        }
-        
-        if (result.fallDetected && !['Yes', 'No'].includes(result.fallDetected)) {
-            console.warn('Invalid fallDetected value:', result.fallDetected);
-        }
-        
-        if (result.confidence !== undefined) {
-            const confidence = parseInt(result.confidence);
-            if (isNaN(confidence) || confidence < 0 || confidence > 100) {
-                console.warn('Invalid confidence value:', result.confidence);
-            }
-        }
-    }
-    
-    isRetryableError(error) {
-        const retryableErrors = [
-            'network error',
-            'timeout',
-            'rate limit',
-            'service unavailable',
-            'connection'
-        ];
-        
-        const errorMessage = error.message.toLowerCase();
-        return retryableErrors.some(retryableError => 
-            errorMessage.includes(retryableError)
-        );
-    }
-    
-    delay(ms) {
-        return new Promise(resolve => setTimeout(resolve, ms));
+        if (!window.File || !window.FileReader || !window.URL) throw new Error('Browser does not support required file APIs.');
+        if (!window.fetch) throw new Error('Browser does not support Fetch API.');
+        if (!document.createElement('video').canPlayType)     throw new Error('Browser does not support video playback.');
+        console.log('Browser compatibility check passed');
     }
 }
 
-// Initialize the app when DOM is ready
+// ── Init ──────────────────────────────────────────────────────────────────────
 $(document).ready(() => {
     try {
-        if (typeof $ === 'undefined') {
-            throw new Error('jQuery is not loaded. Please check your internet connection.');
-        }
-        
-        const requiredElements = ['videoUpload', 'analyzeBtn', 'previewPlayer', 'resultsSection', 'errorAlert'];
-        const missingElements = requiredElements.filter(id => $(`#${id}`).length === 0);
-        
-        if (missingElements.length > 0) {
-            throw new Error(`Required elements not found: ${missingElements.join(', ')}`);
-        }
-        
+        if (typeof $ === 'undefined') throw new Error('jQuery not loaded.');
+        const required = ['videoUpload','analyzeBtn','previewPlayer','resultsSection','errorAlert'];
+        const missing  = required.filter(id => $(`#${id}`).length === 0);
+        if (missing.length) throw new Error(`Missing elements: ${missing.join(', ')}`);
+
         window.fallDetectionApp = new FallDetectionApp();
-        console.log('Fall Detection App initialized successfully');
-        
-    } catch (error) {
-        console.error('Application initialization failed:', error);
-        
-        const errorDiv = document.createElement('div');
-        errorDiv.className = 'alert alert-danger';
-        errorDiv.style.cssText = 'position: fixed; top: 20px; right: 20px; z-index: 9999; max-width: 400px;';
-        errorDiv.innerHTML = `
-            <strong>Application Error:</strong> ${error.message}<br>
-            <small>Please refresh the page and try again.</small>
-        `;
-        document.body.appendChild(errorDiv);
-        
-        setTimeout(() => {
-            if (errorDiv.parentNode) {
-                errorDiv.parentNode.removeChild(errorDiv);
-            }
-        }, 10000);
+        console.log('Fall Detection App initialized');
+    } catch (err) {
+        console.error('App init failed:', err);
+        const div = document.createElement('div');
+        div.className = 'alert alert-danger';
+        div.style.cssText = 'position:fixed;top:20px;right:20px;z-index:9999;max-width:400px;';
+        div.innerHTML = `<strong>Application Error:</strong> ${err.message}<br><small>Please refresh the page.</small>`;
+        document.body.appendChild(div);
+        setTimeout(() => div.parentNode?.removeChild(div), 10000);
     }
 });
